@@ -16,13 +16,19 @@ def log(msg):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %T")
     print('[{}] {}'.format(timestamp, msg), file=sys.stderr)
 
-def fail_variant(variant, tag):
+def calc_filter_string(variant, tag):
+    filter_string = tag
     if variant.FILTER is not None:
-        variant.FILTER = variant.FILTER.split(';') + [tag]
-    else:
-        variant.FILTER = tag
+       filter_string = variant.FILTER.split(';') + [tag]
 
 def will_evaluate(variant, exclude_filters, exclude_fields):
+    '''
+    Determine whether or not the filter or info field
+    allow us to filter/rescue based on their contents
+    This is passed in on the command line so that
+    users can specify if certain variant states
+    should not be rescued or filtered
+    '''
     if variant.FILTER is not None:
         filters = set(variant.FILTER.split(';'))
         for filt_string in exclude_filters:
@@ -35,18 +41,25 @@ def will_evaluate(variant, exclude_filters, exclude_fields):
     return True
 
 def ab_filter_rescue(variant, ab, min_ab, max_ab, dp, min_dp, filter_tag):
+    ab_rescue_field = None
+    filter_string = None
     if (ab >= min_ab and
             ab <= max_ab and
             dp >= min_dp):
         if variant.FILTER is not None:
-            variant.INFO['AB_RESCUED'] = variant.FILTER
-            variant.FILTER = 'PASS'
-            return 1
-        else:
-            return 2
+            ab_rescue_field = variant.FILTER
+            filter_string = 'PASS'
     else:
-        self.fail_variant(filter_tag)
-        return 0
+        filter_string = calc_filter_string(filter_tag)
+    return (filter_string, ab_rescue_field)
+
+def derive_variant_filter_status(variant, het_only, ab, min_ab, max_ab, min_dp, exclude_filters, exclude_fields, hetab, het_hom_alt_ab, total_het_count, total_het_hom_alt_count):
+    if will_evaluate(variant, exclude_filters, exclude_fields):
+        if het_only:
+            return ab_filter_rescue(variant, hetab, min_ab, max_ab, total_het_count, min_dp, filter_tag)
+        else:
+            return ab_filter_rescue(variant, het_hom_alt_ab, min_ab, max_ab, total_het_hom_alt_counts, min_dp, filter_tag)
+    return (None, None)
 
 def is_biallelic(variant):
     return True if len(variant.ALT) == 1 else False
@@ -78,11 +91,15 @@ def compute_allelic_balances(variant):
 
     return (het_ab, het_hom_alt_ab, total_het_counts, total_het_hom_alt_counts)
 
-def update_variant(variant, het_ab, het_hom_alt_ab, total_het_count, total_het_hom_alt_count):
+def update_variant(variant, het_ab, het_hom_alt_ab, total_het_count, total_het_hom_alt_count, filter_field, ab_rescue):
     variant.INFO['HetAB'] = '{:.4f}'.format(het_ab)
     variant.INFO['HetHomAltAB'] = '{:.4f}'.format(het_hom_alt_ab)
     variant.INFO['HetAB_DP'] = '{}'.format(total_het_count)
     variant.INFO['HetHomAltAB_DP'] = '{}'.format(total_het_hom_alt_count)
+    if filter_field is not None:
+        variant.FILTER = filter_field
+    if ab_rescue is not None:
+        variant.INFO['AB_RESCUED'] = ab_rescue
     return variant
 
 def filter_description(ab_tag, depth_tag, min_ab, max_ab, min_dp, exclude_filters, exclude_fields):
@@ -144,38 +161,23 @@ def annotate_allelic_balance(vcffile, region, het_only, min_ab, max_ab, min_dp, 
         'Description' : filter_description(ab_tag, depth_tag, min_ab, max_ab, min_dp, exclude_filters, exclude_fields)
     }
 
-    vcf.add_info_to_header(header_hetab_param_info)
-    vcf.add_info_to_header(header_hetab_dp_param_info)
-    vcf.add_info_to_header(header_het_hom_alt_ab_param_info)
-    vcf.add_info_to_header(header_het_hom_alt_ab_dp_param_info)
-    vcf.add_info_to_header(header_rescued_info)
+    for hdr in ( header_hetab_param_info, header_hetab_dp_param_info, header_het_hom_alt_ab_param_info, header_het_hom_alt_ab_dp_param_info, header_rescued_info ):
+        vcf.add_info_to_header(hdr)
     vcf.add_filter_to_header(header_ab_filter)
     out = Writer('-', vcf)
-    (total_sites, noted_sites, evaluated_sites, passed_sites, rescued_sites, filtered_sites) = (0, 0, 0, 0, 0)
+    (total_sites, noted_sites) = (0, 0)
 
     for variant in vcf(region):
         total_sites += 1
         if is_biallelic(variant):
             noted_sites += 1
             (hetab, het_hom_alt_ab, total_het_count, total_het_hom_alt_count) = compute_allelic_balances(variant)
-            variant = update_variant(variant, hetab, het_hom_alt_ab, total_het_count, total_het_hom_alt_count)
-            if will_evaluate(variant, exclude_filters, exclude_fields):
-                evaluated_sites += 1
-                if het_only:
-                    rv = ab_filter_rescue(variant, hetab, min_ab, max_ab, total_het_count, min_dp, filter_tag)  
-                else:
-                    rv = ab_filter_rescue(variant, het_hom_alt_ab, min_ab, max_ab, total_het_hom_alt_counts, min_dp, filter_tag)
-                if rv == 1:
-                    rescued_sites += 1
-                elif rv == 0:
-                    filtered_sites += 1
-                elif rv == 2:
-                    passed_sites += 1
-
+            (new_filter, ab_rescued) = derive_variant_filter_status(variant, het_only, ab, min_ab, min_dp, exclude_filters, exclude_fields, hetab, het_hom_alt_ab, total_het_count, total_het_hom_alt_count)
+            variant = update_variant(variant, hetab, het_hom_alt_ab, total_het_count, total_het_hom_alt_count, new_filter, ab_rescued)
         out.write_record(variant)
 
     out.close()
-    msg = "Annotated {} out of a possible {} sites.\nEvaluated {} for filtering or rescue.\nPassed {} previously PASS or unfiltered.\nRescued {} previously filtered.\nFailed {} due to allele balance"
+    msg = "Annotated {} out of a possible {} sites."
     msg = msg.format(noted_sites, total_sites, evaluated_sites, passed_sites, rescued_sites, filtered_sites)
     log(msg)
 
